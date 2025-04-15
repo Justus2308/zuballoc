@@ -16,7 +16,7 @@ The allocator is fully compatible with the Zig `Allocator` interface and provide
 1. Run this command:
 
 ```sh
-zig fetch --save git+https://github.com/Justus2308/zuballoc/zuballoc.git
+zig fetch --save git+https://github.com/Justus2308/zuballoc.git
 ```
 
 2. Import the module into your `build.zig` file
@@ -24,9 +24,9 @@ zig fetch --save git+https://github.com/Justus2308/zuballoc/zuballoc.git
 ```zig
 const zuballoc_dependency = b.dependency("zuballoc", .{
     .target = target,
-    .optimize = .optimize,
+    .optimize = optimize,
 });
-exe.root_module.addImport("zuballoc", zuballoc_dependency.module("zuballoc));
+exe.root_module.addImport("zuballoc", zuballoc_dependency.module("zuballoc"));
 ```
 
 ##### Use as a module in your code:
@@ -59,5 +59,7 @@ pub fn main() !void {
     defer list.deinit(allocator);
     
     try list.append(allocator, 123);
+    
+    _ = .{ slice, item };
 }
 ```

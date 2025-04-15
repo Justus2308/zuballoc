@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zuballoc_mod = b.createModule(.{
+    const zuballoc_mod = b.addModule(.{
         .root_source_file = b.path("src/zuballoc.zig"),
         .target = target,
         .optimize = optimize,
