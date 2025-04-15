@@ -38,7 +38,7 @@ const zuballoc = @import("zuballoc");
 pub fn main() !void {
     var buffer: [1024]u8 = undefined;
     var sub_allocator = try zuballoc.SubAllocator.init(std.heap.smp_allocator, &buffer, 256);
-    defer sub_allocator.deinit();
+    defer sub_allocator.deinit(std.heap.smp_allocator);
 
     // Allocations with external metadata
     const slice_allocation = try sub_allocator.allocWithMetadata(u8, 116);
