@@ -2,8 +2,8 @@ ptr: [*]u8,
 size: Size,
 free_storage: Size,
 
-used_bins_top: u32,
-used_bins: [top_bin_count]u8,
+used_bins_top: std.bit_set.IntegerBitSet(top_bin_count),
+used_bins: [top_bin_count]std.bit_set.IntegerBitSet(bins_per_leaf),
 bin_indices: [leaf_bins_count]Node.Index,
 
 nodes: Nodes,
@@ -124,8 +124,8 @@ fn sizeFromFloat(float: f8) Size {
     }
 }
 
-fn findLowestSetBitAfter(mask: Size, start_bit_index: Log2Size) ?Log2Size {
-    const mask_before_start_index = (@as(Size, 1) << start_bit_index) - 1;
+fn findFirstSetAfter(mask: anytype, start_index: math.Log2Int(@TypeOf(mask))) ?math.Log2Int(@TypeOf(mask)) {
+    const mask_before_start_index = (@as(@TypeOf(mask), 1) << start_index) - 1;
     const mask_after_start_index = ~mask_before_start_index;
     const bits_after = (mask & mask_after_start_index);
     if (bits_after == 0) {
@@ -134,7 +134,7 @@ fn findLowestSetBitAfter(mask: Size, start_bit_index: Log2Size) ?Log2Size {
     return @intCast(@ctz(bits_after));
 }
 
-pub fn init(gpa: Allocator, buffer: []u8, max_alloc_count: u32) Allocator.Error!Self {
+pub fn init(gpa: Allocator, buffer: []u8, max_alloc_count: Node.IndexType) Allocator.Error!Self {
     assert(max_alloc_count > 0);
     var self: Self = undefined;
     self.ptr = buffer.ptr;
@@ -159,10 +159,10 @@ pub fn deinit(self: *Self, gpa: Allocator) void {
 
 pub fn reset(self: *Self) void {
     self.free_storage = 0;
-    self.used_bins_top = 0;
+    self.used_bins_top = .initEmpty();
     self.free_offset = .from(@intCast(self.maxAllocCount()));
 
-    @memset(&self.used_bins, 0);
+    @memset(&self.used_bins, .initEmpty());
     @memset(&self.bin_indices, .unused);
 
     const node_count = (self.maxAllocCount() + 1);
@@ -206,11 +206,11 @@ pub fn totalFreeSpace(self: Self) Size {
 }
 
 pub fn largestFreeRegion(self: Self) Size {
-    if (self.free_offset == .unused or self.used_bins_top == 0) {
+    if (self.free_offset == .unused or self.used_bins_top.count() == 0) {
         return 0;
     }
-    const top_bin_index = (math.maxInt(Log2Size) - @clz(self.used_bins_top));
-    const leaf_bin_index = (math.maxInt(Log2Size) - @clz(self.used_bins[top_bin_index]));
+    const top_bin_index = self.used_bins_top.findLastSet() orelse 0;
+    const leaf_bin_index = self.used_bins[top_bin_index].findLastSet() orelse 0;
     const float: f8 = @bitCast(@as(u8, @intCast((top_bin_index << top_bins_index_shift) | leaf_bin_index)));
     const largest_free_region = sizeFromFloat(float);
     assert(self.free_storage >= largest_free_region);
@@ -247,7 +247,7 @@ pub fn storageReport(self: Self) StorageReport {
         while (node_index != .unused) : (node_index = self.nodes[node_index.asInt()].bin_list_next) {
             count += 1;
         }
-        report.free_regions[i] = .{ .size = sizeFromFloat(@as(u8, @intCast(i))), .count = count };
+        report.free_regions[i] = .{ .size = sizeFromFloat(@bitCast(@as(u8, @intCast(i)))), .count = count };
     }
     return report;
 }
@@ -262,8 +262,8 @@ fn insertNodeIntoBin(self: *Self, size: Size, data_offset: Size) Node.Index {
     // Bin was empty before?
     if (self.bin_indices[bin_index] == .unused) {
         // Set bin mask bits
-        self.used_bins[top_bin_index] |= (@as(u8, 1) << leaf_bin_index);
-        self.used_bins_top |= (@as(u32, 1) << top_bin_index);
+        self.used_bins[top_bin_index].set(leaf_bin_index);
+        self.used_bins_top.set(top_bin_index);
     }
 
     // Take a freelist node and insert on top of the bin linked list (next = old top)
@@ -318,13 +318,13 @@ fn removeNodeFromBin(self: *Self, node_index: Node.Index) void {
         // Bin empty?
         if (self.bin_indices[bin_index] == .unused) {
             // Remove a leaf bin mask bit
-            self.used_bins[top_bin_index] &= ~(@as(u8, 1) << leaf_bin_index);
+            self.used_bins[top_bin_index].unset(leaf_bin_index);
         }
 
         // All leaf bins empty?
-        if (self.used_bins[top_bin_index] == 0) {
+        if (self.used_bins[top_bin_index].mask == 0) {
             // Remove a top bin mask bit
-            self.used_bins_top &= ~(@as(u32, 1) << top_bin_index);
+            self.used_bins_top.unset(top_bin_index);
         }
 
         // Insert the node to freelist
@@ -459,26 +459,26 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
 
     const top_bin_index: f8.Exponent, const leaf_bin_index: f8.Mantissa = indices: {
         // If top bin exists, scan its leaf bin. This can fail.
-        const leaf_bin_index_maybe: ?Log2Size = if ((self.used_bins_top & (@as(u32, 1) << min_top_bin_index)) > 0)
-            findLowestSetBitAfter(self.used_bins[min_top_bin_index], min_leaf_bin_index)
+        const leaf_bin_index_maybe: ?f8.Mantissa = if (self.used_bins_top.isSet(min_top_bin_index))
+            findFirstSetAfter(self.used_bins[min_top_bin_index].mask, min_leaf_bin_index)
         else
             null;
 
         if (leaf_bin_index_maybe) |leaf_bin_index| {
-            break :indices .{ min_top_bin_index, @intCast(leaf_bin_index) };
+            break :indices .{ min_top_bin_index, leaf_bin_index };
         }
 
         // If we didn't find space in top bin, we search top bin from +1
-        const top_bin_index = findLowestSetBitAfter(self.used_bins_top, (min_top_bin_index + 1)) orelse {
+        const top_bin_index = findFirstSetAfter(self.used_bins_top.mask, (min_top_bin_index + 1)) orelse {
             // OOM
             return .oom;
         };
 
         // All leaf bins here fit the alloc, since the top bin was rounded up. Start leaf search from bit 0.
         // NOTE: This search can't fail since at least one leaf bit was set because the top bit was set.
-        const leaf_bin_index: f8.Mantissa = @intCast(@ctz(self.used_bins[top_bin_index]));
+        const leaf_bin_index: f8.Mantissa = @intCast(self.used_bins[top_bin_index].findFirstSet().?);
 
-        break :indices .{ @intCast(top_bin_index), leaf_bin_index };
+        break :indices .{ top_bin_index, leaf_bin_index };
     };
 
     const bin_index = ((@as(u8, top_bin_index) << top_bins_index_shift) | @as(u8, leaf_bin_index));
@@ -517,12 +517,12 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
     // Bin empty?
     if (self.bin_indices[bin_index] == .unused) {
         // Remove a leaf bin mask bit
-        self.used_bins[top_bin_index] &= ~(@as(u8, 1) << leaf_bin_index);
+        self.used_bins[top_bin_index].unset(leaf_bin_index);
 
         // All leaf bins empty?
-        if (self.used_bins[top_bin_index] == 0) {
+        if (self.used_bins[top_bin_index].mask == 0) {
             // Remove a top bin mask bit
-            self.used_bins_top &= ~(@as(u32, 1) << top_bin_index);
+            self.used_bins_top.unset(top_bin_index);
         }
     }
 
@@ -568,17 +568,50 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
     };
 }
 
+fn innerResize(self: *Self, metadata: InnerAllocation.Metadata, old_size: Size, new_size: Size) InnerAllocation.Metadata {
+    const node_index = metadata;
+
+    assert(self.is_used.isSet(node_index.asInt()));
+    const node: *Node = &self.nodes[node_index.asInt()];
+
+    // const size_diff = (new_size - old_size);
+
+    _ = .{ node, old_size, new_size };
+    return .unused;
+
+    // TODO
+
+    // var size = node.data_size;
+
+    // if (node.neighbor_next != .unused and self.is_used.isSet(node.neighbor_next.asInt()) == false) {
+    //     // Next (contiguous) free node: Offset remains the same.
+    //     const next_node: *Node = &self.nodes[node.neighbor_next.asInt()];
+
+    //     // Check if the neighbor node can fit the requested size
+    //     if (next_node.data_size < size_diff) {
+    //         return .unused;
+    //     }
+    //     size += next_node.data_size;
+
+    //     // Remove node from the bin linked list and put it in the freelist
+    //     self.removeNodeFromBin(node.neighbor_next);
+
+    //     assert(next_node.neighbor_prev == Node.Index.from(node_index.asInt()));
+    //     node.neighbor_next = next_node.neighbor_next;
+    // }
+}
+
 fn innerFree(self: *Self, metadata: InnerAllocation.Metadata) void {
     const node_index = metadata;
 
-    assert(self.is_used.isSet(node_index.asInt()) == true);
+    assert(self.is_used.isSet(node_index.asInt()));
     const node: *Node = &self.nodes[node_index.asInt()];
 
     // Merge with neighbors...
     var offset = node.data_offset;
     var size = node.data_size;
 
-    if (node.neighbor_prev != .unused and self.is_used.isSet(node.neighbor_prev.asInt()) == false) {
+    if (node.neighbor_prev != .unused and !self.is_used.isSet(node.neighbor_prev.asInt())) {
         // Previous (contiguous) free node: Change offset to previous node offset. Sum sizes
         const prev_node: *Node = &self.nodes[node.neighbor_prev.asInt()];
         offset = prev_node.data_offset;
@@ -637,7 +670,7 @@ pub fn allocator(self: *Self) Allocator {
         .vtable = &.{
             .alloc = alloc,
             .resize = resize,
-            .remap = remap,
+            .remap = Allocator.noRemap,
             .free = free,
         },
     };
@@ -671,13 +704,31 @@ fn alloc(context: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize)
 }
 
 fn resize(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
-    _ = .{ context, memory, alignment, new_len, ret_addr };
-    return false;
-}
+    _ = .{ alignment, ret_addr };
 
-fn remap(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-    _ = .{ context, memory, alignment, new_len, ret_addr };
-    return null;
+    const old_size: Size = @intCast(memory.len);
+    const new_size = math.cast(Size, new_len) orelse {
+        @branchHint(.cold);
+        return false;
+    };
+
+    const self: *Self = @ptrCast(@alignCast(context));
+
+    assert(memory.len >= @sizeOf(InnerAllocation.Metadata));
+    assert(self.ownsSlice(memory));
+
+    const metadata_ptr: *InnerAllocation.Metadata = @ptrFromInt(@intFromPtr(memory.ptr) - @sizeOf(InnerAllocation.Metadata));
+    assert(self.ownsPtr(@ptrCast(metadata_ptr)));
+    const metadata = metadata_ptr.*;
+    assert(metadata != .unused);
+
+    const new_metadata = self.innerResize(metadata, old_size, new_size);
+    if (new_metadata == .unused) {
+        // resize was not possible
+        return false;
+    }
+    metadata_ptr.* = new_metadata;
+    return true;
 }
 
 fn free(context: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
@@ -752,16 +803,18 @@ test "f8<->Size conversion" {
     try testFloatSizeConversion(24678495, 23068672, 25165824);
 }
 
-test findLowestSetBitAfter {
+test findFirstSetAfter {
     const n: u8 = 0b0001_0010;
 
-    const b1 = findLowestSetBitAfter(n, 0);
-    const b2 = findLowestSetBitAfter(n, 3);
-    const b3 = findLowestSetBitAfter(n, 4);
+    const b1 = findFirstSetAfter(n, 0);
+    const b2 = findFirstSetAfter(n, 3);
+    const b3 = findFirstSetAfter(n, 4);
+    const b4 = findFirstSetAfter(n, 6);
 
-    try testing.expect(b1 == 1);
-    try testing.expect(b2 == 4);
-    try testing.expect(b3 == 4);
+    try testing.expect(b1 != null and b1.? == 1);
+    try testing.expect(b2 != null and b2.? == 4);
+    try testing.expect(b3 != null and b3.? == 4);
+    try testing.expect(b4 == null);
 }
 
 var test_memory: [800000 * @sizeOf(u64)]u8 = undefined;
