@@ -15,9 +15,6 @@ const top_bin_count = (1 << f8.exponent_bit_count);
 const bins_per_leaf = (1 << f8.mantissa_bit_count);
 const leaf_bins_count = (top_bin_count * bins_per_leaf);
 
-const top_bins_index_shift: Node.Log2Index = f8.mantissa_bit_count;
-const leaf_bins_index_mask: Node.IndexType = f8.max_mantissa;
-
 const Self = @This();
 
 const Size = u32;
@@ -131,7 +128,7 @@ fn findFirstSetAfter(mask: anytype, start_index: math.Log2Int(@TypeOf(mask))) ?m
     if (bits_after == 0) {
         return null;
     }
-    return @intCast(@ctz(bits_after));
+    return @truncate(@ctz(bits_after));
 }
 
 pub fn init(gpa: Allocator, buffer: []u8, max_alloc_count: Node.IndexType) Allocator.Error!Self {
@@ -211,7 +208,7 @@ pub fn largestFreeRegion(self: Self) Size {
     }
     const top_bin_index = self.used_bins_top.findLastSet() orelse 0;
     const leaf_bin_index = self.used_bins[top_bin_index].findLastSet() orelse 0;
-    const float: f8 = @bitCast(@as(u8, @intCast((top_bin_index << top_bins_index_shift) | leaf_bin_index)));
+    const float = f8{ .mantissa = leaf_bin_index, .exponent = top_bin_index };
     const largest_free_region = sizeFromFloat(float);
     assert(self.free_storage >= largest_free_region);
     return largest_free_region;
@@ -254,20 +251,20 @@ pub fn storageReport(self: Self) StorageReport {
 
 fn insertNodeIntoBin(self: *Self, size: Size, data_offset: Size) Node.Index {
     // Round down to bin index to ensure that bin >= alloc
-    const bin_index = floatFromSize(.floor, size).asInt();
+    const bin_index = floatFromSize(.floor, size);
 
-    const top_bin_index: f8.Exponent = @intCast(bin_index >> top_bins_index_shift);
-    const leaf_bin_index: f8.Mantissa = @intCast(bin_index & leaf_bins_index_mask);
+    const top_bin_index = bin_index.exponent;
+    const leaf_bin_index = bin_index.mantissa;
 
     // Bin was empty before?
-    if (self.bin_indices[bin_index] == .unused) {
+    if (self.bin_indices[bin_index.asInt()] == .unused) {
         // Set bin mask bits
         self.used_bins[top_bin_index].set(leaf_bin_index);
         self.used_bins_top.set(top_bin_index);
     }
 
     // Take a freelist node and insert on top of the bin linked list (next = old top)
-    const top_node_index = self.bin_indices[bin_index];
+    const top_node_index = self.bin_indices[bin_index.asInt()];
     const node_index = self.free_nodes[self.free_offset.asInt()];
     log.debug("Getting node {d} from freelist[{d}] (insertNodeIntoBin)", .{ node_index.asInt(), self.free_offset.asInt() });
     self.free_offset.decr();
@@ -283,7 +280,7 @@ fn insertNodeIntoBin(self: *Self, size: Size, data_offset: Size) Node.Index {
     if (top_node_index != .unused) {
         self.nodes[top_node_index.asInt()].bin_list_prev = node_index;
     }
-    self.bin_indices[bin_index] = node_index;
+    self.bin_indices[bin_index.asInt()] = node_index;
 
     self.free_storage += size;
 
@@ -305,26 +302,26 @@ fn removeNodeFromBin(self: *Self, node_index: Node.Index) void {
         // Hard case: We are the first node in a bin. Find the bin.
 
         // Round down to bin index to ensure that bin >= alloc
-        const bin_index = floatFromSize(.floor, node.data_size).asInt();
+        const bin_index = floatFromSize(.floor, node.data_size);
 
-        const top_bin_index: f8.Exponent = @intCast(bin_index >> top_bins_index_shift);
-        const leaf_bin_index: f8.Mantissa = @intCast(bin_index & leaf_bins_index_mask);
+        const top_bin_index = bin_index.exponent;
+        const leaf_bin_index = bin_index.mantissa;
 
-        self.bin_indices[bin_index] = node.bin_list_next;
+        self.bin_indices[bin_index.asInt()] = node.bin_list_next;
         if (node.bin_list_next != .unused) {
             self.nodes[node.bin_list_next.asInt()].bin_list_prev = .unused;
         }
 
         // Bin empty?
-        if (self.bin_indices[bin_index] == .unused) {
+        if (self.bin_indices[bin_index.asInt()] == .unused) {
             // Remove a leaf bin mask bit
             self.used_bins[top_bin_index].unset(leaf_bin_index);
-        }
 
-        // All leaf bins empty?
-        if (self.used_bins[top_bin_index].mask == 0) {
-            // Remove a top bin mask bit
-            self.used_bins_top.unset(top_bin_index);
+            // All leaf bins empty?
+            if (self.used_bins[top_bin_index].mask == 0) {
+                // Remove a top bin mask bit
+                self.used_bins_top.unset(top_bin_index);
+            }
         }
 
         // Insert the node to freelist
@@ -408,6 +405,21 @@ pub fn alignedAllocWithMetadata(
     };
 }
 
+pub fn resizeWithMetadata(self: *Self, allocation_ptr: anytype, new_len: Size) bool {
+    const ptr_info = @typeInfo(@FieldType(std.meta.Child(@TypeOf(allocation_ptr)), "ptr")).pointer;
+    if (ptr_info.size != .many) @compileError("allocation must be of type slice");
+
+    assert(@inComptime() or self.ownsSlice(mem.sliceAsBytes(allocation_ptr.ptr[0..allocation_ptr.len])));
+
+    const old_size = (allocation_ptr.len * @sizeOf(ptr_info.child));
+    const new_size = (new_len * @sizeOf(ptr_info.child));
+    const ok = self.innerResize(allocation_ptr.metadata, old_size, new_size);
+    if (ok) {
+        allocation_ptr.len = new_len;
+    }
+    return ok;
+}
+
 pub fn freeWithMetadata(self: *Self, allocation: anytype) void {
     const ptr_info = @typeInfo(@FieldType(@TypeOf(allocation), "ptr")).pointer;
     if (ptr_info.size != .many) @compileError("allocation must be of type slice");
@@ -432,7 +444,7 @@ const InnerAllocation = struct {
     }
 };
 
-const MetadataKind = enum { external, intrusive };
+const MetadataKind = enum { external, embedded };
 
 fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, alignment: Size) InnerAllocation {
     if (self.free_offset == .unused) {
@@ -442,30 +454,27 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
 
     const effective_alignment = switch (metadata_kind) {
         .external => alignment,
-        .intrusive => @max(alignment, @alignOf(InnerAllocation.Metadata)),
+        .embedded => @max(alignment, @alignOf(InnerAllocation.Metadata)),
     };
     const effective_size = switch (metadata_kind) {
         .external => size,
-        .intrusive => (effective_alignment + size),
+        .embedded => (effective_alignment + size),
     };
     const size_alignable = (effective_size + effective_alignment - 1);
 
     // Round up to bin index to ensure that alloc >= bin
     // Gives us min bin index that fits the size
-    const min_bin_index = floatFromSize(.ceil, size_alignable).asInt();
+    const min_bin_index = floatFromSize(.ceil, size_alignable);
 
-    const min_top_bin_index: f8.Exponent = @intCast(min_bin_index >> top_bins_index_shift);
-    const min_leaf_bin_index: f8.Mantissa = @intCast(min_bin_index & leaf_bins_index_mask);
+    const min_top_bin_index = min_bin_index.exponent;
+    const min_leaf_bin_index = min_bin_index.mantissa;
 
     const top_bin_index: f8.Exponent, const leaf_bin_index: f8.Mantissa = indices: {
         // If top bin exists, scan its leaf bin. This can fail.
-        const leaf_bin_index_maybe: ?f8.Mantissa = if (self.used_bins_top.isSet(min_top_bin_index))
-            findFirstSetAfter(self.used_bins[min_top_bin_index].mask, min_leaf_bin_index)
-        else
-            null;
-
-        if (leaf_bin_index_maybe) |leaf_bin_index| {
-            break :indices .{ min_top_bin_index, leaf_bin_index };
+        if (self.used_bins_top.isSet(min_top_bin_index)) {
+            if (findFirstSetAfter(self.used_bins[min_top_bin_index].mask, min_leaf_bin_index)) |leaf_bin_index| {
+                break :indices .{ min_top_bin_index, leaf_bin_index };
+            }
         }
 
         // If we didn't find space in top bin, we search top bin from +1
@@ -481,7 +490,10 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
         break :indices .{ top_bin_index, leaf_bin_index };
     };
 
-    const bin_index = ((@as(u8, top_bin_index) << top_bins_index_shift) | @as(u8, leaf_bin_index));
+    const bin_index = f8.asInt(.{
+        .mantissa = leaf_bin_index,
+        .exponent = top_bin_index,
+    });
 
     // Pop the top node of the bin. Bin top = node.next.
     // We also need to account for alignment by offsetting
@@ -494,7 +506,7 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
         const base_addr = (@intFromPtr(self.ptr) + node.data_offset);
         const aligned_addr = mem.alignForward(usize, base_addr, effective_alignment);
         const padding: Size = @intCast(aligned_addr - base_addr);
-        if (metadata_kind == .intrusive and padding < @sizeOf(InnerAllocation.Metadata)) {
+        if (metadata_kind == .embedded and padding < @sizeOf(InnerAllocation.Metadata)) {
             // Metadata does not fit into alignment padding yet
             break :padding (padding + effective_alignment);
         } else {
@@ -504,7 +516,6 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
     const size_aligned = (alignment_padding + size);
     assert(size_aligned <= node_total_size);
 
-    node.data_size = size_aligned;
     self.is_used.set(node_index.asInt());
     self.bin_indices[bin_index] = node.bin_list_next;
     if (node.bin_list_next != .unused) {
@@ -532,34 +543,35 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
     const remainder_size_rhs = (node_total_size - size_aligned);
     if (remainder_size_rhs > 0) {
         const new_node_index = self.insertNodeIntoBin(remainder_size_rhs, (node.data_offset + size_aligned));
+        node.data_size -= remainder_size_rhs;
 
         // Link nodes next to each other so that we can merge them later if both are free
         // And update the old next neighbor to point to the new node (in middle)
         if (node.neighbor_next != .unused) {
             self.nodes[node.neighbor_next.asInt()].neighbor_prev = new_node_index;
-            self.nodes[new_node_index.asInt()].neighbor_prev = node_index;
             self.nodes[new_node_index.asInt()].neighbor_next = node.neighbor_next;
-            node.neighbor_next = new_node_index;
         }
+        self.nodes[new_node_index.asInt()].neighbor_prev = node_index;
+        node.neighbor_next = new_node_index;
     }
 
     const remainder_size_lhs = switch (metadata_kind) {
         .external => alignment_padding,
-        .intrusive => (alignment_padding - @sizeOf(InnerAllocation.Metadata)),
+        .embedded => (alignment_padding - @sizeOf(InnerAllocation.Metadata)),
     };
     if (remainder_size_lhs > 0) {
         const new_node_index = self.insertNodeIntoBin(remainder_size_lhs, node.data_offset);
         node.data_offset += remainder_size_lhs;
-        node.data_size = (size_aligned - remainder_size_lhs);
+        node.data_size -= remainder_size_lhs;
 
         // Link nodes next to each other so that we can merge them later if both are free
         // And update the old next neighbor to point to the new node (in middle)
         if (node.neighbor_prev != .unused) {
             self.nodes[node.neighbor_prev.asInt()].neighbor_next = new_node_index;
-            self.nodes[new_node_index.asInt()].neighbor_next = node_index;
             self.nodes[new_node_index.asInt()].neighbor_prev = node.neighbor_prev;
-            node.neighbor_prev = new_node_index;
         }
+        self.nodes[new_node_index.asInt()].neighbor_next = node_index;
+        node.neighbor_prev = new_node_index;
     }
 
     return InnerAllocation{
@@ -568,37 +580,70 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
     };
 }
 
-fn innerResize(self: *Self, metadata: InnerAllocation.Metadata, old_size: Size, new_size: Size) InnerAllocation.Metadata {
+fn innerResize(self: *Self, metadata: InnerAllocation.Metadata, old_size: Size, new_size: Size) bool {
     const node_index = metadata;
 
     assert(self.is_used.isSet(node_index.asInt()));
     const node: *Node = &self.nodes[node_index.asInt()];
 
-    // const size_diff = (new_size - old_size);
+    const size_diff = (@as(i64, new_size) - @as(i64, old_size));
 
-    _ = .{ node, old_size, new_size };
-    return .unused;
+    if (size_diff > 0) {
+        if (node.neighbor_next == .unused or self.is_used.isSet(node.neighbor_next.asInt())) {
+            return false;
+        }
+        const next_node: *Node = &self.nodes[node.neighbor_next.asInt()];
 
-    // TODO
+        // Check if the neighbor node can fit the requested size
+        if (next_node.data_size < @as(Size, @intCast(size_diff))) {
+            return false;
+        }
+        log.debug("Resizing node {d} from {d} to {d} (resize)", .{
+            node_index.asInt(),
+            node.data_size,
+            (node.data_size + @as(Size, @intCast(size_diff))),
+        });
+        node.data_size += @as(Size, @intCast(size_diff));
 
-    // var size = node.data_size;
+        const remainder_size = (next_node.data_size - @as(Size, @intCast(size_diff)));
+        const neighbor_next = next_node.neighbor_next;
 
-    // if (node.neighbor_next != .unused and self.is_used.isSet(node.neighbor_next.asInt()) == false) {
-    //     // Next (contiguous) free node: Offset remains the same.
-    //     const next_node: *Node = &self.nodes[node.neighbor_next.asInt()];
+        // Remove node from the bin linked list
+        self.removeNodeFromBin(node.neighbor_next);
 
-    //     // Check if the neighbor node can fit the requested size
-    //     if (next_node.data_size < size_diff) {
-    //         return .unused;
-    //     }
-    //     size += next_node.data_size;
+        if (remainder_size > 0) {
+            const new_node_index = self.insertNodeIntoBin(remainder_size, (node.data_offset + node.data_size));
 
-    //     // Remove node from the bin linked list and put it in the freelist
-    //     self.removeNodeFromBin(node.neighbor_next);
+            if (neighbor_next != .unused) {
+                self.nodes[neighbor_next.asInt()].neighbor_prev = new_node_index;
+                self.nodes[new_node_index.asInt()].neighbor_next = neighbor_next;
+            }
+            self.nodes[new_node_index.asInt()].neighbor_prev = node_index;
+            node.neighbor_next = new_node_index;
+        }
 
-    //     assert(next_node.neighbor_prev == Node.Index.from(node_index.asInt()));
-    //     node.neighbor_next = next_node.neighbor_next;
-    // }
+        assert(next_node.neighbor_prev == Node.Index.from(node_index.asInt()));
+        node.neighbor_next = next_node.neighbor_next;
+    } else if (size_diff < 0) {
+        const remainder_size: Size = @intCast(-size_diff);
+        log.debug("Resizing node {d} from {d} to {d} (resize)", .{
+            node_index.asInt(),
+            node.data_size,
+            (node.data_size - @as(Size, @intCast(-size_diff))),
+        });
+        node.data_size -= remainder_size;
+
+        const new_node_index = self.insertNodeIntoBin(remainder_size, (node.data_offset + node.data_size));
+
+        if (node.neighbor_next != .unused) {
+            self.nodes[node.neighbor_next.asInt()].neighbor_prev = new_node_index;
+            self.nodes[new_node_index.asInt()].neighbor_next = node.neighbor_next;
+        }
+        self.nodes[new_node_index.asInt()].neighbor_prev = node_index;
+        node.neighbor_next = new_node_index;
+    }
+
+    return true;
 }
 
 fn innerFree(self: *Self, metadata: InnerAllocation.Metadata) void {
@@ -659,10 +704,10 @@ fn innerFree(self: *Self, metadata: InnerAllocation.Metadata) void {
 }
 
 /// To conform to Zig's `Allocator` interface this allocator uses
-/// intrusive metadata and might not be suitable for some use cases.
+/// embedded metadata and might not be suitable for some use cases.
 /// If you need externally stored metadata, use the `...WithMetadata`
 /// functions this type provides.
-/// Note that the effective size of all allocations with intrusive
+/// Note that the effective size of all allocations with embedded
 /// metadata will be at least `@sizeOf(Node.Index) + alloc_size`.
 pub fn allocator(self: *Self) Allocator {
     return Allocator{
@@ -689,7 +734,7 @@ fn alloc(context: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize)
     };
 
     const self: *Self = @ptrCast(@alignCast(context));
-    const inner_allocation = self.innerAlloc(.intrusive, size, alignment_in_bytes);
+    const inner_allocation = self.innerAlloc(.embedded, size, alignment_in_bytes);
     if (inner_allocation.isOutOfMemory()) {
         @branchHint(.unlikely);
         return null;
@@ -722,13 +767,7 @@ fn resize(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usiz
     const metadata = metadata_ptr.*;
     assert(metadata != .unused);
 
-    const new_metadata = self.innerResize(metadata, old_size, new_size);
-    if (new_metadata == .unused) {
-        // resize was not possible
-        return false;
-    }
-    metadata_ptr.* = new_metadata;
-    return true;
+    return self.innerResize(metadata, old_size, new_size);
 }
 
 fn free(context: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
@@ -835,7 +874,7 @@ test "basic usage with external metadata" {
     try testing.expect(big_slice.len == 600000);
 }
 
-test "basic usage with intrusive metadata" {
+test "basic usage with embedded metadata" {
     testing.log_level = testing_log_level;
 
     var self = try Self.init(testing.allocator, &test_memory, test_max_allocs);
@@ -847,6 +886,51 @@ test "basic usage with intrusive metadata" {
     try std.heap.testAllocatorAligned(a);
     try std.heap.testAllocatorLargeAlignment(a);
     try std.heap.testAllocatorAlignedShrink(a);
+}
+
+test "skewed allocation parameters" {
+    testing.log_level = testing_log_level;
+
+    // FIXME use mem.Alignment on zig master
+    const buffer = try testing.allocator.alignedAlloc(u8, 16, 1001);
+    defer testing.allocator.free(buffer);
+
+    // 1000 bytes capacity
+    var self = try Self.init(testing.allocator, buffer[1..buffer.len], 32);
+    defer self.deinit(testing.allocator);
+
+    // Since buffer is 15 bytes out of alignment padding is required.
+    // This padding should be released back to the allocator as a node.
+    const a1 = try self.alignedAllocWithMetadata(u8, .@"16", 500);
+    defer self.freeWithMetadata(a1);
+
+    // Should result in two nodes with 15 and 485 bytes respectively.
+    // We cannot allocate the full 485 bits here because of fragmentation.
+    const a2 = try self.allocWithMetadata(u8, 460);
+    defer self.freeWithMetadata(a2);
+
+    const a3 = try self.allocWithMetadata(u8, 15);
+    defer self.freeWithMetadata(a3);
+}
+
+test "resize" {
+    testing.log_level = testing_log_level;
+
+    var self = try Self.init(testing.allocator, &test_memory, test_max_allocs);
+    defer self.deinit(testing.allocator);
+
+    const a1 = try self.allocWithMetadata(u8, 12);
+    defer self.freeWithMetadata(a1);
+
+    const a2 = try self.allocWithMetadata(u8, 12);
+
+    var a3 = try self.allocWithMetadata(u8, 12);
+    defer self.freeWithMetadata(a3);
+
+    self.freeWithMetadata(a2);
+
+    const ok = self.resizeWithMetadata(&a3, 20);
+    try testing.expect(ok);
 }
 
 test reset {
