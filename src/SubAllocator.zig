@@ -891,8 +891,7 @@ test "basic usage with embedded metadata" {
 test "skewed allocation parameters" {
     testing.log_level = testing_log_level;
 
-    // FIXME use mem.Alignment on zig master
-    const buffer = try testing.allocator.alignedAlloc(u8, 16, 1001);
+    const buffer = try testing.allocator.alignedAlloc(u8, .@"16", 1001);
     defer testing.allocator.free(buffer);
 
     // 1000 bytes capacity
