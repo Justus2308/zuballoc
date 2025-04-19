@@ -355,7 +355,7 @@ pub fn Allocation(comptime T: type, comptime kind: AllocationKindWithAlignment) 
     return switch (kind) {
         .pointer => struct {
             ptr: *T,
-            metadata: Node.Index,
+            metadata: InnerAllocation.Metadata,
 
             pub fn toGeneric(self: @This()) GenericAllocation {
                 return GenericAllocation{
@@ -370,7 +370,7 @@ pub fn Allocation(comptime T: type, comptime kind: AllocationKindWithAlignment) 
             break :slice struct {
                 ptr: [*]align(alignment_in_bytes) T,
                 len: Size,
-                metadata: Node.Index,
+                metadata: InnerAllocation.Metadata,
 
                 pub inline fn slice(self: @This()) []align(alignment_in_bytes) T {
                     return self.ptr[0..self.len];
@@ -395,22 +395,22 @@ pub fn Allocation(comptime T: type, comptime kind: AllocationKindWithAlignment) 
 pub const GenericAllocation = struct {
     ptr: [*]u8,
     size: Size,
-    metadata: Node.Index,
+    metadata: InnerAllocation.Metadata,
 
-    pub const CastError = math.AlignCastError || error{ InvalidAllocationKind, InvalidSize };
+    pub const CastError = math.AlignCastError || error{InvalidSize};
 
     pub fn cast(self: GenericAllocation, comptime T: type, comptime kind: AllocationKind) CastError!Allocation(T, .selfAligned(kind)) {
         return switch (kind) {
-            .pointer => if (self.size != @sizeOf(T)) CastError.InvalidAllocationKind else .{
+            .pointer => if (self.size != @sizeOf(T)) CastError.InvalidSize else .{
                 .ptr = @ptrCast(try math.alignCast(.of(T), self.ptr)),
                 .metadata = self.metadata,
             },
-            .slice => self.castAligned(T, .of(T)),
+            .slice => self.castAligned(T, null),
         };
     }
-    pub fn castAligned(self: GenericAllocation, comptime T: type, comptime alignment: Alignment) CastError!Allocation(T, .{ .slice = alignment }) {
+    pub fn castAligned(self: GenericAllocation, comptime T: type, comptime alignment: ?Alignment) CastError!Allocation(T, .{ .slice = alignment }) {
         return .{
-            .ptr = @ptrCast(try math.alignCast(alignment, self.ptr)),
+            .ptr = @ptrCast(try math.alignCast(alignment orelse .of(T), self.ptr)),
             .len = math.divExact(Size, self.size, @sizeOf(T)) catch return CastError.InvalidSize,
             .metadata = self.metadata,
         };
