@@ -224,9 +224,10 @@ pub const StorageReport = struct {
 
     pub fn print(report: StorageReport) void {
         std.debug.print("===== STORAGE REPORT =====\n", .{});
-        for (report.free_regions) |free_region| {
+        for (report.free_regions, 0..) |free_region, i| {
             if (free_region.count > 0) {
-                std.debug.print("size={d},count={d}\n", .{
+                std.debug.print("[{d}] size={d},count={d}\n", .{
+                    i,
                     free_region.size,
                     free_region.count,
                 });
@@ -335,15 +336,34 @@ fn removeNodeFromBin(self: *Self, node_index: Node.Index) void {
     }
 }
 
-const AllocationKind = union(enum) {
+pub const AllocationKind = enum {
+    pointer,
+    slice,
+};
+pub const AllocationKindWithAlignment = union(AllocationKind) {
     pointer,
     slice: ?Alignment,
+
+    pub fn selfAligned(kind: AllocationKind) AllocationKindWithAlignment {
+        return switch (kind) {
+            .pointer => .pointer,
+            .slice => .{ .slice = null },
+        };
+    }
 };
-fn Allocation(comptime T: type, comptime kind: AllocationKind) type {
+pub fn Allocation(comptime T: type, comptime kind: AllocationKindWithAlignment) type {
     return switch (kind) {
         .pointer => struct {
             ptr: *T,
             metadata: Node.Index,
+
+            pub fn toGeneric(self: @This()) GenericAllocation {
+                return GenericAllocation{
+                    .ptr = @ptrCast(self.ptr),
+                    .size = @sizeOf(T),
+                    .metadata = self.metadata,
+                };
+            }
         },
         .slice => |alignment| slice: {
             const alignment_in_bytes = if (alignment) |a| a.toByteUnits() else @alignOf(T);
@@ -355,14 +375,55 @@ fn Allocation(comptime T: type, comptime kind: AllocationKind) type {
                 pub inline fn slice(self: @This()) []align(alignment_in_bytes) T {
                     return self.ptr[0..self.len];
                 }
+
+                pub fn toGeneric(self: @This()) GenericAllocation {
+                    return GenericAllocation{
+                        .ptr = @ptrCast(self.ptr),
+                        .size = (@sizeOf(T) * self.len),
+                        .metadata = self.metadata,
+                    };
+                }
             };
         },
     };
 }
 
+/// Type-erased `Allocation` type for easier generic
+/// storage of different kinds of allocations.
+/// Passing this type to any `...WithMetadata` functions
+/// without casting first results in undefined behavior!
+pub const GenericAllocation = struct {
+    ptr: [*]u8,
+    size: Size,
+    metadata: Node.Index,
+
+    pub const CastError = math.AlignCastError || error{ InvalidAllocationKind, InvalidSize };
+
+    pub fn cast(self: GenericAllocation, comptime T: type, comptime kind: AllocationKind) CastError!Allocation(T, .selfAligned(kind)) {
+        return switch (kind) {
+            .pointer => if (self.size != @sizeOf(T)) CastError.InvalidAllocationKind else .{
+                .ptr = @ptrCast(try math.alignCast(.of(T), self.ptr)),
+                .metadata = self.metadata,
+            },
+            .slice => self.castAligned(T, .of(T)),
+        };
+    }
+    pub fn castAligned(self: GenericAllocation, comptime T: type, comptime alignment: Alignment) CastError!Allocation(T, .{ .slice = alignment }) {
+        return .{
+            .ptr = @ptrCast(try math.alignCast(alignment, self.ptr)),
+            .len = math.divExact(Size, self.size, @sizeOf(T)) catch return CastError.InvalidSize,
+            .metadata = self.metadata,
+        };
+    }
+
+    pub fn raw(self: GenericAllocation) []u8 {
+        return self.ptr[0..self.size];
+    }
+};
+
 pub fn createWithMetadata(self: *Self, comptime T: type) Allocator.Error!Allocation(T, .pointer) {
     const size: Size = @sizeOf(T);
-    const inner_allocation = self.innerAlloc(.external, size, @alignOf(T));
+    const inner_allocation = self.innerAlloc(.external, size, .of(T));
     if (inner_allocation.isOutOfMemory()) {
         return Allocator.Error.OutOfMemory;
     }
@@ -391,13 +452,13 @@ pub fn alignedAllocWithMetadata(
     comptime alignment: ?Alignment,
     n: Size,
 ) Allocator.Error!Allocation(T, .{ .slice = alignment }) {
-    const alignment_in_bytes: Size = comptime @intCast(if (alignment) |a| a.toByteUnits() else @alignOf(T));
+    const alignment_resolved = alignment orelse Alignment.of(T);
     const size: Size = math.cast(Size, (n * @sizeOf(T))) orelse return Allocator.Error.OutOfMemory;
-    const inner_allocation = self.innerAlloc(.external, size, alignment_in_bytes);
+    const inner_allocation = self.innerAlloc(.external, size, alignment_resolved);
     if (inner_allocation.isOutOfMemory()) {
         return Allocator.Error.OutOfMemory;
     }
-    const ptr: [*]align(alignment_in_bytes) T = @ptrCast(@alignCast(self.ptr[inner_allocation.offset..]));
+    const ptr: [*]align(alignment_resolved.toByteUnits()) T = @ptrCast(@alignCast(self.ptr[inner_allocation.offset..]));
     return .{
         .ptr = ptr,
         .len = n,
@@ -446,7 +507,7 @@ const InnerAllocation = struct {
 
 const MetadataKind = enum { external, embedded };
 
-fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, alignment: Size) InnerAllocation {
+fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, alignment: Alignment) InnerAllocation {
     if (self.free_offset == .unused) {
         @branchHint(.unlikely);
         return .oom;
@@ -454,13 +515,17 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
 
     const effective_alignment = switch (metadata_kind) {
         .external => alignment,
-        .embedded => @max(alignment, @alignOf(InnerAllocation.Metadata)),
+        .embedded => Alignment.max(alignment, .of(InnerAllocation.Metadata)),
+    };
+    const effective_alignment_in_bytes = math.cast(Size, effective_alignment.toByteUnits()) orelse {
+        @branchHint(.cold);
+        return .oom;
     };
     const effective_size = switch (metadata_kind) {
         .external => size,
-        .embedded => (effective_alignment + size),
+        .embedded => (effective_alignment_in_bytes + size),
     };
-    const size_alignable = (effective_size + effective_alignment - 1);
+    const size_alignable = (effective_size + effective_alignment_in_bytes - 1);
 
     // Round up to bin index to ensure that alloc >= bin
     // Gives us min bin index that fits the size
@@ -504,11 +569,11 @@ fn innerAlloc(self: *Self, comptime metadata_kind: MetadataKind, size: Size, ali
 
     const alignment_padding = padding: {
         const base_addr = (@intFromPtr(self.ptr) + node.data_offset);
-        const aligned_addr = mem.alignForward(usize, base_addr, effective_alignment);
+        const aligned_addr = effective_alignment.forward(base_addr);
         const padding: Size = @intCast(aligned_addr - base_addr);
         if (metadata_kind == .embedded and padding < @sizeOf(InnerAllocation.Metadata)) {
             // Metadata does not fit into alignment padding yet
-            break :padding (padding + effective_alignment);
+            break :padding (padding + effective_alignment_in_bytes);
         } else {
             break :padding padding;
         }
@@ -728,13 +793,9 @@ fn alloc(context: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize)
         @branchHint(.cold);
         return null;
     };
-    const alignment_in_bytes = math.cast(Size, alignment.toByteUnits()) orelse {
-        @branchHint(.cold);
-        return null;
-    };
 
     const self: *Self = @ptrCast(@alignCast(context));
-    const inner_allocation = self.innerAlloc(.embedded, size, alignment_in_bytes);
+    const inner_allocation = self.innerAlloc(.embedded, size, alignment);
     if (inner_allocation.isOutOfMemory()) {
         @branchHint(.unlikely);
         return null;
@@ -794,6 +855,12 @@ fn sliceContainsPtr(container: []const u8, ptr: [*]const u8) bool {
 fn sliceContainsSlice(container: []const u8, slice: []const u8) bool {
     return @intFromPtr(slice.ptr) >= @intFromPtr(container.ptr) and
         (@intFromPtr(slice.ptr) + slice.len) <= (@intFromPtr(container.ptr) + container.len);
+}
+
+comptime {
+    if (mem.byte_size_in_bits != 8) {
+        @compileError("this allocator depends on byte size being 8 bits");
+    }
 }
 
 const builtin = @import("builtin");
@@ -864,14 +931,23 @@ test "basic usage with external metadata" {
 
     var self = try Self.init(testing.allocator, &test_memory, test_max_allocs);
     defer self.deinit(testing.allocator);
+
     const ptr = try self.createWithMetadata(u16);
     defer self.destroyWithMetadata(ptr);
+
+    try testing.expect(self.totalFreeSpace() == (test_memory.len - @sizeOf(u16)));
+
     const slice = try self.allocWithMetadata(u16, 3);
     defer self.freeWithMetadata(slice);
+
     try testing.expect(slice.len == 3);
+    try testing.expect(self.totalFreeSpace() == (test_memory.len - (4 * @sizeOf(u16))));
+
     const big_slice = try self.allocWithMetadata(u16, 600000);
     defer self.freeWithMetadata(big_slice);
+
     try testing.expect(big_slice.len == 600000);
+    try testing.expect(self.totalFreeSpace() == (test_memory.len - (600004 * @sizeOf(u16))));
 }
 
 test "basic usage with embedded metadata" {
@@ -903,6 +979,8 @@ test "skewed allocation parameters" {
     const a1 = try self.alignedAllocWithMetadata(u8, .@"16", 500);
     defer self.freeWithMetadata(a1);
 
+    try testing.expect(self.totalFreeSpace() == 500);
+
     // Should result in two nodes with 15 and 485 bytes respectively.
     // We cannot allocate the full 485 bits here because of fragmentation.
     const a2 = try self.allocWithMetadata(u8, 460);
@@ -910,6 +988,28 @@ test "skewed allocation parameters" {
 
     const a3 = try self.allocWithMetadata(u8, 15);
     defer self.freeWithMetadata(a3);
+
+    try testing.expect(self.totalFreeSpace() == 25);
+}
+
+test "aligned allocations" {
+    testing.log_level = testing_log_level;
+
+    var self = try Self.init(testing.allocator, &test_memory, test_max_allocs);
+    defer self.deinit(testing.allocator);
+
+    const max_align_pow2 = 16;
+
+    var allocations: [max_align_pow2]GenericAllocation = undefined;
+    inline for (0..max_align_pow2) |i| {
+        const alignment: Alignment = @enumFromInt(i);
+        const allocation = try self.alignedAllocWithMetadata(u8, alignment, 32);
+        allocations[i] = allocation.toGeneric();
+    }
+    inline for (0..max_align_pow2) |i| {
+        const allocation = try allocations[i].castAligned(u8, @enumFromInt(i));
+        self.freeWithMetadata(allocation);
+    }
 }
 
 test "resize" {
@@ -926,10 +1026,16 @@ test "resize" {
     var a3 = try self.allocWithMetadata(u8, 12);
     defer self.freeWithMetadata(a3);
 
+    try testing.expect(self.totalFreeSpace() == (test_memory.len - 12 - 12 - 12));
+
     self.freeWithMetadata(a2);
+
+    try testing.expect(self.totalFreeSpace() == (test_memory.len - 12 - 12));
 
     const ok = self.resizeWithMetadata(&a3, 20);
     try testing.expect(ok);
+
+    try testing.expect(self.totalFreeSpace() == (test_memory.len - 12 - 20));
 }
 
 test reset {
