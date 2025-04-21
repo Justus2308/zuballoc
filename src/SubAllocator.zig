@@ -4,7 +4,7 @@ free_storage: Size,
 
 used_bins_top: std.bit_set.IntegerBitSet(top_bin_count),
 used_bins: [top_bin_count]std.bit_set.IntegerBitSet(bins_per_leaf),
-bin_indices: [leaf_bins_count]Node.Index,
+bin_indices: [leaf_bin_count]Node.Index,
 
 nodes: Nodes,
 is_used: std.DynamicBitSetUnmanaged,
@@ -13,7 +13,7 @@ free_offset: Node.Index,
 
 const top_bin_count = (1 << f8.exponent_bit_count);
 const bins_per_leaf = (1 << f8.mantissa_bit_count);
-const leaf_bins_count = (top_bin_count * bins_per_leaf);
+const leaf_bin_count = (top_bin_count * bins_per_leaf);
 
 const Self = @This();
 
@@ -208,14 +208,14 @@ pub fn largestFreeRegion(self: Self) Size {
     }
     const top_bin_index = self.used_bins_top.findLastSet() orelse 0;
     const leaf_bin_index = self.used_bins[top_bin_index].findLastSet() orelse 0;
-    const float = f8{ .mantissa = leaf_bin_index, .exponent = top_bin_index };
+    const float = f8{ .mantissa = @intCast(leaf_bin_index), .exponent = @intCast(top_bin_index) };
     const largest_free_region = sizeFromFloat(float);
     assert(self.free_storage >= largest_free_region);
     return largest_free_region;
 }
 
 pub const StorageReport = struct {
-    free_regions: [leaf_bins_count]Region,
+    free_regions: [leaf_bin_count]Region,
 
     pub const Region = struct {
         size: Size,
@@ -239,7 +239,7 @@ pub const StorageReport = struct {
 
 pub fn storageReport(self: Self) StorageReport {
     var report: StorageReport = .{ .free_regions = undefined };
-    for (0..leaf_bins_count) |i| {
+    for (0..leaf_bin_count) |i| {
         var count: u32 = 0;
         var node_index = self.bin_indices[i];
         while (node_index != .unused) : (node_index = self.nodes[node_index.asInt()].bin_list_next) {
@@ -401,7 +401,9 @@ pub const GenericAllocation = struct {
 
     pub fn cast(self: GenericAllocation, comptime T: type, comptime kind: AllocationKind) CastError!Allocation(T, .selfAligned(kind)) {
         return switch (kind) {
-            .pointer => if (self.size != @sizeOf(T)) CastError.InvalidSize else .{
+            .pointer => if (self.size != @sizeOf(T)) {
+                return CastError.InvalidSize;
+            } else .{
                 .ptr = @ptrCast(try math.alignCast(.of(T), self.ptr)),
                 .metadata = self.metadata,
             },
@@ -1053,4 +1055,35 @@ test reset {
     self.reset();
 
     allocation = try self.allocWithMetadata(u8, 8);
+}
+
+test GenericAllocation {
+    testing.log_level = testing_log_level;
+
+    var self = try Self.init(testing.allocator, &test_memory, 256);
+    defer self.deinit(testing.allocator);
+
+    const a1 = try self.createWithMetadata(u64);
+    const a2 = try self.allocWithMetadata(u32, 128);
+    const a3 = try self.alignedAllocWithMetadata(u16, .@"8", 32);
+
+    const g1 = a1.toGeneric();
+    const g2 = a2.toGeneric();
+    const g3 = a3.toGeneric();
+
+    try testing.expect(self.ownsSlice(g1.raw()));
+    try testing.expect(self.ownsSlice(g2.raw()));
+    try testing.expect(self.ownsSlice(g3.raw()));
+
+    try testing.expect(g1.size == @sizeOf(u64));
+    try testing.expect(g2.size == (a2.len * @sizeOf(u32)));
+    try testing.expect(g3.size == (a3.len * @sizeOf(u16)));
+
+    const c1 = try g1.cast(u64, .pointer);
+    const c2 = try g2.cast(u32, .slice);
+    const c3 = try g3.castAligned(u16, .@"8");
+
+    try testing.expectEqualDeep(c1, a1);
+    try testing.expectEqualDeep(c2, a2);
+    try testing.expectEqualDeep(c3, a3);
 }
