@@ -357,6 +357,14 @@ pub fn Allocation(comptime T: type, comptime kind: AllocationKindWithAlignment) 
             ptr: *T,
             metadata: InnerAllocation.Metadata,
 
+            pub inline fn get(self: @This()) *T {
+                return self.ptr;
+            }
+
+            pub inline fn slice(self: @This()) []T {
+                return @as([*]T, @ptrCast(self.ptr))[0..1];
+            }
+
             pub fn toGeneric(self: @This()) GenericAllocation {
                 return GenericAllocation{
                     .ptr = @ptrCast(self.ptr),
@@ -371,6 +379,10 @@ pub fn Allocation(comptime T: type, comptime kind: AllocationKindWithAlignment) 
                 ptr: [*]align(alignment_in_bytes) T,
                 len: Size,
                 metadata: InnerAllocation.Metadata,
+
+                pub inline fn get(self: @This()) []align(alignment_in_bytes) T {
+                    return self.slice();
+                }
 
                 pub inline fn slice(self: @This()) []align(alignment_in_bytes) T {
                     return self.ptr[0..self.len];
@@ -950,6 +962,12 @@ test "basic usage with external metadata" {
 
     try testing.expect(big_slice.len == 600000);
     try testing.expect(self.totalFreeSpace() == (test_memory.len - (600004 * @sizeOf(u16))));
+
+    ptr.get().* = 0xBABA;
+    try testing.expect(ptr.ptr.* == 0xBABA);
+
+    slice.get()[0] = 0xBABA;
+    try testing.expect(slice.slice()[0] == 0xBABA);
 }
 
 test "basic usage with embedded metadata" {

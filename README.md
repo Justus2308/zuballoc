@@ -63,11 +63,11 @@ pub fn main() !void {
     // Allocations with external metadata
     const slice_allocation = try sub_allocator.allocWithMetadata(u8, 116);
     defer sub_allocator.freeWithMetadata(slice_allocation);
-    const slice: []u8 = slice_allocation.slice();
+    const slice: []u8 = slice_allocation.get();
 
     const single_allocation = try sub_allocator.createWithMetadata(u64);
     defer sub_allocator.destroyWithMetadata(single_allocation);
-    const item: *u64 = single_allocation.ptr;
+    const item: *u64 = single_allocation.get();
 
     // Allocations with intrusive metadata
     const allocator = sub_allocator.allocator();
